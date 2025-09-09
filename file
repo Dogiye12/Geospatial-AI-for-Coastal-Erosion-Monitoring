@@ -1,0 +1,364 @@
+"""
+Geospatial-AI-for-Coastal-Erosion-Monitoring (synthetic demo)
+Author: You
+Python >=3.9 recommended
+
+Creates:
+- data/coastline_points.geojson
+- data/coastal_erosion_training.csv
+- outputs/feature_importance.png
+- outputs/regression_fit.png
+- outputs/erosion_risk_map.html
+"""
+
+import os
+import warnings
+warnings.filterwarnings("ignore")
+
+import random
+import numpy as np
+import pandas as pd
+
+# Geospatial + viz (optional but recommended)
+try:
+    import geopandas as gpd
+    from shapely.geometry import Point, LineString
+except Exception:
+    gpd = None
+    Point = None
+    LineString = None
+
+# ML
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.metrics import mean_absolute_error, r2_score, classification_report, confusion_matrix
+from sklearn.inspection import permutation_importance
+
+# Plots
+import matplotlib.pyplot as plt
+
+# Mapping
+try:
+    import folium
+    from folium.plugins import MarkerCluster
+except Exception:
+    folium = None
+
+
+# -----------------------------
+# 0) Repro / folders
+# -----------------------------
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+
+os.makedirs("data", exist_ok=True)
+os.makedirs("outputs", exist_ok=True)
+
+
+# -----------------------------
+# 1) Build a synthetic coastline and transects
+# -----------------------------
+def build_synthetic_coastline(n_points: int = 320):
+    """
+    Create a gently curving coastline around Nigeria's coastal longitudes.
+    We'll generate points from lon ~ 3.0 to 6.5 and lat ~ 4.3-4.8
+    """
+    lons = np.linspace(3.0, 6.5, n_points)
+    # Gentle sinusoidal shoreline curvature + small noise
+    lats = 4.55 + 0.15*np.sin((lons-3.0)*np.pi/1.5) + np.random.normal(0, 0.005, size=n_points)
+    return lons, lats
+
+def make_geodataframe(lons, lats, crs="EPSG:4326"):
+    if gpd is None or Point is None:
+        return None
+    geometries = [Point(lon, lat) for lon, lat in zip(lons, lats)]
+    gdf = gpd.GeoDataFrame({"idx": np.arange(len(lons))}, geometry=geometries, crs=crs)
+    return gdf
+
+
+# -----------------------------
+# 2) Simulate drivers & shoreline change history
+# -----------------------------
+def simulate_drivers(lons, lats):
+    """
+    Generate synthetic drivers commonly used in coastal erosion modeling.
+    Values are normalized-ish but realistic ranges are not enforced (demo).
+    """
+    n = len(lons)
+
+    # Wave energy proxy (open coast segments higher; use longitude and curvature)
+    wave_energy = 0.4 + 0.4*np.sin((lons-2.5)*np.pi/1.2) + np.random.normal(0, 0.05, n)
+    wave_energy = np.clip(wave_energy, 0, 1)
+
+    # Nearshore slope (steeper shelves reduce shoreline mobility)
+    slope = 0.3 + 0.3*np.cos((lons-3.2)*np.pi/1.7) + np.random.normal(0, 0.04, n)
+    slope = np.clip(slope, 0.05, 1)
+
+    # Sediment supply index (higher near river mouths)
+    # Make a few “river mouths” along the coast
+    river_mouths = np.array([3.4, 4.1, 5.2, 6.1])
+    dist_to_river = np.min(np.abs(lons.reshape(-1,1) - river_mouths.reshape(1,-1)), axis=1)
+    sediment_supply = np.exp(-dist_to_river/0.3) + 0.1*np.random.rand(n)
+    sediment_supply = (sediment_supply - sediment_supply.min()) / (sediment_supply.max() - sediment_supply.min())
+
+    # Human activity index (coastal infrastructure / sand mining / reclamation)
+    human_activity = 0.2 + 0.6*np.random.rand(n)
+    # Impose a few “hotspots”
+    activity_hotspots = [(3.8, 0.8), (5.6, 0.85)]
+    for c, lvl in activity_hotspots:
+        human_activity += lvl*np.exp(-((lons - c)**2)/(2*0.06**2))
+    human_activity = (human_activity - human_activity.min())/(human_activity.max()-human_activity.min())
+
+    # Vegetation stability proxy (mean NDVI-ish; higher reduces erosion)
+    veg_stability = 0.3 + 0.6*np.random.rand(n)
+    veg_stability = (veg_stability - veg_stability.min())/(veg_stability.max()-veg_stability.min())
+
+    # Add some coastal curvature metric (convex embayments may trap sediment)
+    curvature = np.gradient(np.gradient(lats))
+    curvature = (curvature - curvature.min())/(curvature.max()-curvature.min()+1e-9)
+
+    df = pd.DataFrame({
+        "lon": lons,
+        "lat": lats,
+        "wave_energy": wave_energy,
+        "slope": slope,
+        "sediment_supply": sediment_supply,
+        "human_activity": human_activity,
+        "veg_stability": veg_stability,
+        "curvature": curvature
+    })
+    return df
+
+def simulate_shoreline_positions(df):
+    """
+    Create historical shoreline position offsets (m) relative to 2000 baseline,
+    governed by the synthetic drivers. Negative => landward (erosion).
+    """
+    n = len(df)
+
+    # True underlying "erosion pressure"
+    # High wave_energy, high human_activity -> more erosion (negative)
+    # High slope, sediment_supply, veg_stability -> less erosion (positive)
+    pressure = (
+        + 0.9*df["wave_energy"]
+        + 0.8*df["human_activity"]
+        - 0.7*df["slope"]
+        - 1.0*df["sediment_supply"]
+        - 0.6*df["veg_stability"]
+        + 0.3*df["curvature"]
+    )
+
+    # Normalize
+    pressure = (pressure - pressure.mean())/pressure.std()
+
+    # Convert to decadal shoreline displacement (m)
+    # Negative means retreat (erosion). Scale by ~[−80, +60] over a decade.
+    decadal_change = -40*pressure + np.random.normal(0, 6, n)
+
+    # Build positions relative to a 2000 baseline at 0 m
+    pos_2000 = np.zeros(n)
+    pos_2010 = pos_2000 + decadal_change
+    pos_2020 = pos_2010 + (decadal_change * (0.8 + 0.4*np.random.rand(n)))  # slightly different rate
+    pos_2024 = pos_2020 + (decadal_change * 0.4 + np.random.normal(0, 3, n))  # 4-year partial decade
+
+    # Historical erosion rate (m/yr) using 2000->2024 displacement
+    years = 2024 - 2000
+    erosion_rate = (pos_2024 - pos_2000) / years  # negative = erosion
+
+    out = df.copy()
+    out["shoreline_2000_m"] = pos_2000
+    out["shoreline_2010_m"] = pos_2010
+    out["shoreline_2020_m"] = pos_2020
+    out["shoreline_2024_m"] = pos_2024
+    out["erosion_rate_m_per_yr"] = erosion_rate
+
+    # Binary erosion risk label (1 = at-risk); threshold more negative than −1.2 m/yr
+    out["erosion_risk"] = (erosion_rate < -1.2).astype(int)
+
+    return out
+
+
+# -----------------------------
+# 3) Train models (regression & classification)
+# -----------------------------
+def train_models(df):
+    feature_cols = ["wave_energy","slope","sediment_supply","human_activity","veg_stability","curvature"]
+    X = df[feature_cols].values
+    y_reg = df["erosion_rate_m_per_yr"].values
+    y_cls = df["erosion_risk"].values
+
+    X_train, X_test, yreg_train, yreg_test = train_test_split(X, y_reg, test_size=0.25, random_state=SEED)
+    _, _, ycls_train, ycls_test = train_test_split(X, y_cls, test_size=0.25, random_state=SEED)
+
+    reg = RandomForestRegressor(n_estimators=400, max_depth=None, random_state=SEED, n_jobs=-1)
+    reg.fit(X_train, yreg_train)
+    yreg_pred = reg.predict(X_test)
+
+    mae = mean_absolute_error(yreg_test, yreg_pred)
+    r2  = r2_score(yreg_test, yreg_pred)
+
+    cls = RandomForestClassifier(n_estimators=400, max_depth=None, random_state=SEED, n_jobs=-1)
+    cls.fit(X_train, ycls_train)
+    ycls_pred = cls.predict(X_test)
+
+    report = classification_report(ycls_test, ycls_pred, digits=3)
+    cm = confusion_matrix(ycls_test, ycls_pred)
+
+    # Permutation importance (helps interpretability)
+    reg_perm = permutation_importance(reg, X_test, yreg_test, n_repeats=15, random_state=SEED, n_jobs=-1)
+    cls_perm = permutation_importance(cls, X_test, ycls_test, n_repeats=15, random_state=SEED, n_jobs=-1)
+
+    results = {
+        "feature_cols": feature_cols,
+        "reg": reg, "cls": cls,
+        "reg_metrics": {"MAE": mae, "R2": r2},
+        "cls_report": report, "cls_cm": cm,
+        "reg_perm": reg_perm, "cls_perm": cls_perm,
+        "X_test": X_test, "yreg_test": yreg_test, "yreg_pred": yreg_pred
+    }
+    return results
+
+
+# -----------------------------
+# 4) Forecast 2030 & export
+# -----------------------------
+def forecast_and_export(df, models):
+    reg = models["reg"]
+    cls = models["cls"]
+    feature_cols = models["feature_cols"]
+
+    # Predict erosion rate for 2030 as same driver relationship (toy assumption)
+    X = df[feature_cols].values
+    df["pred_erosion_rate_2030_m_per_yr"] = reg.predict(X)
+
+    # Predict erosion risk for 2030
+    df["pred_erosion_risk_2030"] = cls.predict(X)
+
+    # Project shoreline position to 2030 from 2024 using 6-year rate
+    years_to_2030 = 2030 - 2024
+    df["proj_shoreline_2030_m"] = df["shoreline_2024_m"] + df["pred_erosion_rate_2030_m_per_yr"]*years_to_2030
+
+    # Save CSV
+    df.to_csv("data/coastal_erosion_training.csv", index=False)
+
+    # Save GeoJSON (if geopandas available)
+    if gpd is not None and Point is not None:
+        gdf = gpd.GeoDataFrame(
+            df.copy(),
+            geometry=[Point(xy) for xy in zip(df["lon"], df["lat"])],
+            crs="EPSG:4326"
+        )
+        gdf.to_file("data/coastline_points.geojson", driver="GeoJSON")
+
+    return df
+
+
+# -----------------------------
+# 5) Plots & Map
+# -----------------------------
+def plot_feature_importance(models):
+    feature_cols = models["feature_cols"]
+
+    # Regression permutation importances
+    reg_perm = models["reg_perm"]
+    imp_means = reg_perm.importances_mean
+    imp_stds  = reg_perm.importances_std
+
+    order = np.argsort(imp_means)
+    plt.figure(figsize=(7,5))
+    plt.barh(np.array(feature_cols)[order], imp_means[order], xerr=imp_stds[order])
+    plt.xlabel("Permutation importance (decrease in score)")
+    plt.title("Driver Importance for Erosion Rate (Regression)")
+    plt.tight_layout()
+    plt.savefig("outputs/feature_importance.png", dpi=160)
+    plt.close()
+
+def plot_regression_fit(models):
+    y_true = models["yreg_test"]
+    y_pred = models["yreg_pred"]
+
+    plt.figure(figsize=(6,6))
+    plt.scatter(y_true, y_pred, alpha=0.45, edgecolor="none")
+    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    plt.plot(lims, lims)
+    plt.xlabel("Observed erosion rate (m/yr)")
+    plt.ylabel("Predicted erosion rate (m/yr)")
+    plt.title("Regression Fit")
+    plt.tight_layout()
+    plt.savefig("outputs/regression_fit.png", dpi=160)
+    plt.close()
+
+def make_map(df):
+    if folium is None:
+        print("folium not installed; skipping map export.")
+        return
+
+    # Color by predicted 2030 erosion risk
+    m = folium.Map(location=[df["lat"].mean(), df["lon"].mean()], zoom_start=8, tiles="cartodbpositron")
+    cluster = MarkerCluster().add_to(m)
+
+    for _, row in df.iterrows():
+        risk = int(row["pred_erosion_risk_2030"])
+        color = "red" if risk == 1 else "green"
+        popup = folium.Popup(html=(
+            f"<b>Lon/Lat:</b> {row['lon']:.4f}, {row['lat']:.4f}<br>"
+            f"<b>Erosion rate 2000–2024:</b> {row['erosion_rate_m_per_yr']:.2f} m/yr<br>"
+            f"<b>Pred. rate 2030:</b> {row['pred_erosion_rate_2030_m_per_yr']:.2f} m/yr<br>"
+            f"<b>Proj shoreline 2030:</b> {row['proj_shoreline_2030_m']:.1f} m<br>"
+            f"<b>Risk 2030:</b> {'At risk' if risk==1 else 'Lower risk'}"
+        ), max_width=300)
+
+        folium.CircleMarker(
+            location=[row["lat"], row["lon"]],
+            radius=4,
+            popup=popup,
+            color=color,
+            fill=True,
+            fill_opacity=0.8
+        ).add_to(cluster)
+
+    m.save("outputs/erosion_risk_map.html")
+
+
+# -----------------------------
+# 6) Main
+# -----------------------------
+def main():
+    # 1) Coastline + points
+    lons, lats = build_synthetic_coastline(n_points=320)  # >100 points
+    if gpd is not None:
+        gdf = make_geodataframe(lons, lats)
+        print(f"Generated {len(gdf)} synthetic coastline points.")
+    else:
+        print(f"Generated {len(lons)} synthetic coastline points (geopandas not installed).")
+
+    # 2) Drivers + shoreline history
+    drivers = simulate_drivers(lons, lats)
+    data = simulate_shoreline_positions(drivers)
+
+    # 3) Train models
+    models = train_models(data)
+    print("Regression metrics:", models["reg_metrics"])
+    print("\nClassification report:\n", models["cls_report"])
+    print("Confusion matrix:\n", models["cls_cm"])
+
+    # 4) Forecast & export
+    df_out = forecast_and_export(data, models)
+
+    # 5) Plots + Map
+    plot_feature_importance(models)
+    plot_regression_fit(models)
+    make_map(df_out)
+
+    print("\nArtifacts created:")
+    print(" - data/coastal_erosion_training.csv")
+    if gpd is not None:
+        print(" - data/coastline_points.geojson")
+    print(" - outputs/feature_importance.png")
+    print(" - outputs/regression_fit.png")
+    if folium is not None:
+        print(" - outputs/erosion_risk_map.html")
+
+if __name__ == "__main__":
+    main()
